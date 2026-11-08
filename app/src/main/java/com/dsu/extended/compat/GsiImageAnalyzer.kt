@@ -4,7 +4,6 @@ import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
-import java.util.Locale
 import java.util.concurrent.CancellationException
 import java.util.zip.GZIPInputStream
 import java.util.zip.ZipInputStream
@@ -14,28 +13,45 @@ import org.tukaani.xz.XZInputStream
  * Reads enough of a GSI to make a useful compatibility decision: container,
  * filesystem, sparse format, size, partition layout and build.prop values.
  * Nothing is mounted or executed; the image is only read.
+ *
+ * Analysis is best-effort by design. Filesystem metadata is read directly when
+ * the source is seekable, and anything that would require walking the whole
+ * image is capped by [ScanBudget] so a multi-gigabyte image cannot leave the
+ * user on an endless "Validating image" spinner.
  */
 class GsiImageAnalyzer {
 
     fun analyze(
         input: GsiImageInput,
         isCancelled: () -> Boolean = { false },
+        budget: ScanBudget = ScanBudget(),
+        onProgress: (Float) -> Unit = {},
     ): GsiFacts {
         val header = runCatching { input.readHeader() }.getOrDefault(ByteArray(0))
         return try {
             checkCancelled(isCancelled)
             when (detectContainer(header)) {
-                ImageContainer.GZIP -> analyzeCompressed(input, ImageContainer.GZIP, isCancelled) {
-                    GZIPInputStream(BufferedInputStream(it, BUFFER_BYTES))
-                }
+                ImageContainer.GZIP -> analyzeCompressed(
+                    input = input,
+                    container = ImageContainer.GZIP,
+                    isCancelled = isCancelled,
+                    budget = budget,
+                    onProgress = onProgress,
+                ) { GZIPInputStream(BufferedInputStream(it, BUFFER_BYTES)) }
 
-                ImageContainer.XZ -> analyzeCompressed(input, ImageContainer.XZ, isCancelled) {
-                    XZInputStream(BufferedInputStream(it, BUFFER_BYTES))
-                }
+                ImageContainer.XZ -> analyzeCompressed(
+                    input = input,
+                    container = ImageContainer.XZ,
+                    isCancelled = isCancelled,
+                    budget = budget,
+                    onProgress = onProgress,
+                ) { XZInputStream(BufferedInputStream(it, BUFFER_BYTES)) }
 
-                ImageContainer.ZIP -> analyzeZip(input, isCancelled)
-                ImageContainer.RAW -> analyzeRaw(input, header, isCancelled)
+                ImageContainer.ZIP -> analyzeZip(input, isCancelled, budget, onProgress)
+                ImageContainer.RAW -> analyzeRaw(input, header, isCancelled, budget, onProgress)
             }
+        } catch (expired: ScanBudget.ExpiredException) {
+            partialFacts(header, input)
         } catch (t: Throwable) {
             if (t is CancellationException) throw t
             GsiFacts(
@@ -51,6 +67,8 @@ class GsiImageAnalyzer {
         input: GsiImageInput,
         container: ImageContainer,
         isCancelled: () -> Boolean,
+        budget: ScanBudget,
+        onProgress: (Float) -> Unit,
         streamFactory: (InputStream) -> InputStream,
     ): GsiFacts {
         val raw = input.openStream()
@@ -67,6 +85,8 @@ class GsiImageAnalyzer {
                 input = input,
                 expectedRawSize = input.declaredRawSize,
                 isCancelled = isCancelled,
+                budget = budget,
+                onProgress = onProgress,
             )
         }
     }
@@ -75,37 +95,61 @@ class GsiImageAnalyzer {
         input: GsiImageInput,
         header: ByteArray,
         isCancelled: () -> Boolean,
+        budget: ScanBudget,
+        onProgress: (Float) -> Unit,
     ): GsiFacts {
-        val base = baseFacts(header, ImageContainer.RAW, input)
-        if (base.hasGpt || base.hasSuper || base.hasBootMagic) return base
-
-        if (!base.sparse && base.fileSystem == ImageFileSystem.EXT4) {
-            val seekable = input.seekableSource
-            if (seekable != null) {
-                val ext4 = Ext4Image(seekable)
-                val info = runCatching { ext4.open() }.getOrNull()
-                if (info != null) {
-                    val props = runCatching { ext4.readBuildProps() }.getOrDefault(emptyMap())
-                    if (props.isNotEmpty()) {
-                        return base.copy(
-                            fileSystem = ImageFileSystem.EXT4,
-                            rawSizeBytes = info.rawSize,
-                            props = props,
-                            propsSource = "ext4",
-                        )
+        val sparseContainer = isSparseHeader(header)
+        var sparseView: SparseSeekableSource? = null
+        var factsHeader = header
+        if (sparseContainer) {
+            val source = input.seekableSource
+            if (source != null) {
+                runCatching { SparseSeekableSource(source, budget) }.getOrNull()?.let { view ->
+                    val logicalHeader = runCatching {
+                        view.readExactly(0L, GsiImageInput.HEADER_BYTES)
+                    }.getOrNull()
+                    if (logicalHeader != null) {
+                        sparseView = view
+                        factsHeader = logicalHeader
                     }
                 }
             }
         }
 
+        val detected = baseFacts(factsHeader, ImageContainer.RAW, input)
+        val base = detected.copy(
+            sparse = sparseContainer,
+            rawSizeBytes = sparseView?.size ?: detected.rawSizeBytes,
+        )
+        if (base.hasGpt || base.hasSuper || base.hasBootMagic) return base
+
+        val ext4Source = sparseView ?: input.seekableSource
+        if (base.fileSystem == ImageFileSystem.EXT4 && ext4Source != null) {
+            val ext4 = Ext4Image(ext4Source)
+            val info = runCatching { ext4.open() }.getOrNull()
+            if (info != null) {
+                val props = runCatching { ext4.readBuildProps() }.getOrDefault(emptyMap())
+                if (props.isNotEmpty()) {
+                    return base.copy(
+                        fileSystem = ImageFileSystem.EXT4,
+                        rawSizeBytes = info.rawSize,
+                        props = props,
+                        propsSource = "ext4",
+                    )
+                }
+            }
+        }
+
         // Sparse images, EROFS and ext4 layouts the parser cannot follow are read
-        // sequentially. This still yields the filesystem, size and build.prop text.
+        // sequentially, but only until the budget is spent.
         return analyzeLogicalStream(
             stream = input.openStream(),
             container = ImageContainer.RAW,
             input = input,
-            expectedRawSize = input.declaredRawSize,
+            expectedRawSize = base.rawSizeBytes.takeIf { it > 0L } ?: input.declaredRawSize,
             isCancelled = isCancelled,
+            budget = budget,
+            onProgress = onProgress,
         )
     }
 
@@ -115,6 +159,8 @@ class GsiImageAnalyzer {
         input: GsiImageInput,
         expectedRawSize: Long,
         isCancelled: () -> Boolean,
+        budget: ScanBudget,
+        onProgress: (Float) -> Unit,
     ): GsiFacts {
         val buffered = BufferedInputStream(stream, BUFFER_BYTES)
         val logical = try {
@@ -129,9 +175,16 @@ class GsiImageAnalyzer {
             }
             val first = ByteArray(GsiImageInput.HEADER_BYTES)
             var firstLength = 0
+            var stalledReads = 0
             while (firstLength < first.size) {
+                budget.check()
                 val read = logical.read(first, firstLength, first.size - firstLength)
                 if (read < 0) break
+                if (read == 0) {
+                    if (++stalledReads > MAX_STALLED_READS) throw IOException("Image stream stalled")
+                    continue
+                }
+                stalledReads = 0
                 firstLength += read
             }
             val facts = baseFacts(first.copyOf(firstLength), container, input).copy(
@@ -140,60 +193,98 @@ class GsiImageAnalyzer {
             val scanner = PropLineScanner()
             scanner.accept(first, 0, firstLength)
             var totalRead = firstLength.toLong()
+            val totalBytes = when {
+                logical.unsparseSize > 0L -> logical.unsparseSize
+                expectedRawSize > 0L -> expectedRawSize
+                else -> 0L
+            }
+            val progressStep = if (totalBytes > 0L) maxOf(PROGRESS_MIN_STEP, totalBytes / PROGRESS_STEPS) else 0L
+            var lastReported = totalRead
+            if (totalBytes > 0L) onProgress(progress(totalRead, totalBytes))
+            var reachedEof = false
             val buffer = ByteArray(BUFFER_BYTES)
             while (true) {
                 checkCancelled(isCancelled)
+                if (budget.isExpired) break
                 val read = logical.read(buffer, 0, buffer.size)
-                if (read < 0) break
+                if (read < 0) {
+                    reachedEof = true
+                    break
+                }
+                if (read == 0) {
+                    if (++stalledReads > MAX_STALLED_READS) throw IOException("Image stream stalled")
+                    continue
+                }
+                stalledReads = 0
                 totalRead += read
                 if (totalRead > MAX_DECODED_BYTES) {
                     throw IOException("Decoded image exceeds the safety limit")
                 }
                 scanner.accept(buffer, 0, read)
+                if (totalBytes > 0L && totalRead - lastReported >= progressStep) {
+                    lastReported = totalRead
+                    onProgress(progress(totalRead, totalBytes))
+                }
+                // build.prop lives in one contiguous file, so once the values
+                // that drive the decisions are in hand there is nothing left to
+                // learn from the remaining gigabytes.
+                if (scanner.hasDecisionProps()) break
             }
-            val unsparseSize = logical.unsparseSize.takeIf { it > 0L }
-            val rawSize = unsparseSize
+            if (reachedEof && totalBytes > 0L) onProgress(1f)
+            val knownSize = logical.unsparseSize.takeIf { it > 0L }
+            val rawSize = knownSize
+                ?: expectedRawSize.takeIf { it > 0L }
                 ?: totalRead.takeIf { it > 0L }
-                ?: expectedRawSize
-            val mismatch = expectedRawSize > 0L &&
-                unsparseSize == null &&
+                ?: 0L
+            val mismatch = reachedEof &&
+                knownSize == null &&
+                expectedRawSize > 0L &&
                 kotlin.math.abs(expectedRawSize - totalRead) > SIZE_MISMATCH_TOLERANCE
             return facts.copy(
                 sparse = logical.isSparse,
                 rawSizeBytes = rawSize,
                 props = scanner.props,
                 propsSource = "stream",
-                scanComplete = true,
+                scanComplete = reachedEof,
                 sizeMismatch = mismatch,
             )
         }
     }
 
-    private fun analyzeZip(input: GsiImageInput, isCancelled: () -> Boolean): GsiFacts {
+    private fun analyzeZip(
+        input: GsiImageInput,
+        isCancelled: () -> Boolean,
+        budget: ScanBudget,
+        onProgress: (Float) -> Unit,
+    ): GsiFacts {
         val images = mutableListOf<String>()
-        var selectedEntry: String? = null
-        var systemEntry: String? = null
 
         ZipInputStream(BufferedInputStream(input.openStream(), BUFFER_BYTES)).use { zip ->
-            var entry = zip.nextEntry
-            while (entry != null) {
+            while (true) {
                 checkCancelled(isCancelled)
+                budget.check()
+                val entry = zip.nextEntry ?: break
                 if (!entry.isDirectory && entry.name.endsWith(".img", ignoreCase = true)) {
-                    val name = entry.name
-                    images += name
-                    val baseName = name.substringAfterLast('/')
-                    val partition = baseName.dropLast(IMAGE_SUFFIX_LENGTH)
-                    if (selectedEntry == null) selectedEntry = name
-                    if (systemEntry == null && partition.equals("system", ignoreCase = true)) {
-                        systemEntry = name
+                    images += entry.name
+                    val partition = entry.name.substringAfterLast('/').dropLast(IMAGE_SUFFIX_LENGTH)
+                    if (partition.equals("system", ignoreCase = true)) {
+                        val facts = analyzeLogicalStream(
+                            stream = zip,
+                            container = ImageContainer.ZIP,
+                            input = input,
+                            expectedRawSize = entry.size.takeIf { it > 0L } ?: input.declaredRawSize,
+                            isCancelled = isCancelled,
+                            budget = budget,
+                            onProgress = onProgress,
+                        )
+                        return facts.copy(zipImages = images)
                     }
                 }
                 zip.closeEntry()
-                entry = zip.nextEntry
             }
         }
 
-        val selected = systemEntry ?: selectedEntry
+        val selected = images.firstOrNull()
             ?: return GsiFacts(
                 container = ImageContainer.ZIP,
                 storedSizeBytes = input.storedSize,
@@ -203,9 +294,10 @@ class GsiImageAnalyzer {
             )
 
         ZipInputStream(BufferedInputStream(input.openStream(), BUFFER_BYTES)).use { zip ->
-            var entry = zip.nextEntry
-            while (entry != null) {
+            while (true) {
                 checkCancelled(isCancelled)
+                budget.check()
+                val entry = zip.nextEntry ?: break
                 if (entry.name == selected) {
                     val facts = analyzeLogicalStream(
                         stream = zip,
@@ -213,11 +305,12 @@ class GsiImageAnalyzer {
                         input = input,
                         expectedRawSize = entry.size.takeIf { it > 0L } ?: input.declaredRawSize,
                         isCancelled = isCancelled,
+                        budget = budget,
+                        onProgress = onProgress,
                     )
                     return facts.copy(zipImages = images)
                 }
                 zip.closeEntry()
-                entry = zip.nextEntry
             }
         }
 
@@ -229,16 +322,30 @@ class GsiImageAnalyzer {
         )
     }
 
+    private fun partialFacts(header: ByteArray, input: GsiImageInput): GsiFacts {
+        val container = detectContainer(header)
+        return baseFacts(header, container, input).copy(
+            propsSource = null,
+            scanComplete = false,
+        )
+    }
+
+    private fun progress(processed: Long, total: Long): Float =
+        (processed.toDouble() / total.toDouble()).coerceIn(0.0, 1.0).toFloat()
+
     private fun checkCancelled(isCancelled: () -> Boolean) {
         if (isCancelled()) throw CancellationException("GSI analysis cancelled")
     }
+
+    private fun isSparseHeader(header: ByteArray): Boolean =
+        header.size >= 4 && le32(header, 0) == SPARSE_MAGIC
 
     private fun baseFacts(
         header: ByteArray,
         container: ImageContainer,
         input: GsiImageInput,
     ): GsiFacts {
-        val sparse = header.size >= 4 && le32(header, 0) == SPARSE_MAGIC
+        val sparse = isSparseHeader(header)
         val rawSize = if (sparse && header.size >= 28) {
             val blockSize = le32(header, 12).toLong() and 0xFFFFFFFFL
             val blocks = le32(header, 16).toLong() and 0xFFFFFFFFL
@@ -321,6 +428,14 @@ class GsiImageAnalyzer {
         private val result = LinkedHashMap<String, String>()
 
         val props: Map<String, String> get() = result
+
+        fun hasDecisionProps(): Boolean {
+            val sdk = result.containsKey("ro.build.version.sdk") ||
+                result.containsKey("ro.system.build.version.sdk")
+            if (!sdk) return false
+            return result.containsKey("ro.product.cpu.abi") ||
+                result.containsKey("ro.product.cpu.abilist")
+        }
 
         fun accept(bytes: ByteArray, offset: Int, length: Int) {
             var index = offset
@@ -437,6 +552,9 @@ class GsiImageAnalyzer {
         private const val SIZE_MISMATCH_TOLERANCE = 1024L * 1024L
         private const val MAX_DECODED_BYTES = 64L * 1024L * 1024L * 1024L
         private const val IMAGE_SUFFIX_LENGTH = 4
+        private const val MAX_STALLED_READS = 64
+        private const val PROGRESS_STEPS = 100L
+        private const val PROGRESS_MIN_STEP = 1024L * 1024L
         private const val SPARSE_MAGIC = 0xED26FF3A.toInt()
         private const val EXT4_MAGIC = 0xEF53
         private const val EROFS_MAGIC = 0xE0F5E1E2.toInt()

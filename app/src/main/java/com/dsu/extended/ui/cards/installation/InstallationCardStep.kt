@@ -103,7 +103,7 @@ fun InstallationCardStep(
                 textSecondButton = stringResource(id = R.string.cancel),
                 onClickSecondButton = onClickCancelInstallation,
                 showProgressBar = true,
-                isIndeterminate = true,
+                progress = uiState.installationProgress,
             )
         InstallationStep.DISCARD_CURRENT_GSI -> {
             ProgressableCardContent(

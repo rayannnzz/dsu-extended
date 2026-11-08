@@ -323,7 +323,9 @@ class HomeViewModel @Inject constructor(
                 currentPartitionText = "",
             )
         }
-        val report = GsiCompatibilityChecker(application, session, storageManager).check(dsuInstallation)
+        val report = GsiCompatibilityChecker(application, session, storageManager).check(dsuInstallation) { progress ->
+            onPreparationProgressUpdate(progress)
+        }
         AppLogger.i(
             tag,
             "GSI compatibility checked",

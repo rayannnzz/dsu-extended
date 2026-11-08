@@ -19,11 +19,15 @@ class GsiCompatibilityChecker(
     private val storageManager: StorageManager,
 ) {
 
-    suspend fun check(source: DSUInstallationSource): GsiCompatibilityReport =
+    suspend fun check(
+        source: DSUInstallationSource,
+        onProgress: (Float) -> Unit = {},
+    ): GsiCompatibilityReport =
         withContext(Dispatchers.IO) {
             val uri = source.uri
             val storedSize = runCatching { storageManager.getFilesizeFromUri(uri) }.getOrDefault(-1L)
             val displayName = resolvedName(uri)
+            val budget = ScanBudget()
 
             var seekable: SeekableSource? = null
             try {
@@ -34,12 +38,18 @@ class GsiCompatibilityChecker(
                     declaredRawSize = source.fileSize,
                     seekable = seekable,
                     streamFactory = {
-                        runCatching { openStream(uri) }
+                        val stream = runCatching { openStream(uri) }
                             .getOrElse { error -> seekable?.openStream() ?: throw error }
+                        DeadlineInputStream(stream, budget)
                     },
                 )
                 val job = coroutineContext[Job]
-                val facts = GsiImageAnalyzer().analyze(input) { job?.isActive == false }
+                val facts = GsiImageAnalyzer().analyze(
+                    input = input,
+                    isCancelled = { job?.isActive == false },
+                    budget = budget,
+                    onProgress = onProgress,
+                )
                 val device = DeviceProfileReader().read()
                 GsiCompatibilityEvaluator().evaluate(
                     facts = facts,

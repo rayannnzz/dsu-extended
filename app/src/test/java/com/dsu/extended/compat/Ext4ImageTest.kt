@@ -1,12 +1,16 @@
 package com.dsu.extended.compat
 
+import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.io.InputStream
 import java.nio.channels.FileChannel
 import java.nio.file.StandardOpenOption
 import java.util.zip.GZIPOutputStream
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
@@ -69,6 +73,131 @@ class Ext4ImageTest {
         assertEquals(34, gzipFacts.sdk)
         assertEquals("arm64-v8a", gzipFacts.abi)
     }
+
+    @Test
+    fun analyzerReadsSparseExt4WithoutDecodingWholeImage() {
+        val image = createExt4Image(blockSize = 4096)
+        val sparseFile = File(image.parentFile, "system.sparse.img")
+        sparseFile.writeBytes(sparsify(image.readBytes(), blockSize = 4096, blocksPerChunk = 256))
+        val counting = CountingSeekableSource(openSource(sparseFile))
+        try {
+            val facts = GsiImageAnalyzer().analyze(
+                GsiImageInput(
+                    displayName = sparseFile.name,
+                    storedSize = sparseFile.length(),
+                    declaredRawSize = image.length(),
+                    seekable = counting,
+                    streamFactory = { FileInputStream(sparseFile) },
+                ),
+                budget = ScanBudget(5_000L),
+            )
+            assertTrue(facts.sparse)
+            assertEquals(ImageFileSystem.EXT4, facts.fileSystem)
+            assertEquals("ext4", facts.propsSource)
+            assertEquals(34, facts.sdk)
+            assertEquals("arm64-v8a", facts.abi)
+            assertEquals(image.length(), facts.rawSizeBytes)
+            assertTrue(
+                "ext4 metadata should be read without scanning the image, read=${counting.bytesRead}",
+                counting.bytesRead < image.length() / 2,
+            )
+        } finally {
+            counting.close()
+        }
+    }
+
+    @Test
+    fun analyzerStopsAtBudgetAndKeepsDeclaredSize() {
+        val image = createExt4Image(blockSize = 4096)
+        val gzip = File(image.parentFile, "budget.img.gz")
+        FileInputStream(image).use { input ->
+            GZIPOutputStream(FileOutputStream(gzip)).use { output -> input.copyTo(output) }
+        }
+        val declaredSize = image.length()
+        val facts = withSource(gzip) { source ->
+            GsiImageAnalyzer().analyze(
+                GsiImageInput(
+                    displayName = gzip.name,
+                    storedSize = gzip.length(),
+                    declaredRawSize = declaredSize,
+                    seekable = source,
+                    streamFactory = { FileInputStream(gzip) },
+                ),
+                budget = ScanBudget(0L),
+            )
+        }
+        assertEquals(ImageContainer.GZIP, facts.container)
+        assertEquals(declaredSize, facts.rawSizeBytes)
+        assertFalse(facts.scanComplete)
+        assertNull(facts.error)
+    }
+
+    private class CountingSeekableSource(
+        private val delegate: SeekableSource,
+    ) : SeekableSource {
+        var bytesRead = 0L
+
+        override val size: Long
+            get() = delegate.size
+
+        override fun readAt(
+            offset: Long,
+            destination: ByteArray,
+            destinationOffset: Int,
+            length: Int,
+        ): Int {
+            val read = delegate.readAt(offset, destination, destinationOffset, length)
+            if (read > 0) bytesRead += read
+            return read
+        }
+
+        override fun openStream(): InputStream = delegate.openStream()
+
+        override fun close() = delegate.close()
+    }
+
+    private fun openSource(file: File): SeekableSource {
+        val channel = FileChannel.open(file.toPath(), StandardOpenOption.READ)
+        return ChannelSeekableSource(channel, channel)
+    }
+
+    private fun sparsify(image: ByteArray, blockSize: Int, blocksPerChunk: Int): ByteArray {
+        val chunkBytes = blockSize * blocksPerChunk
+        require(chunkBytes > 0 && image.size % chunkBytes == 0) {
+            "Image size must align with the sparse chunk size"
+        }
+        val totalBlocks = image.size / blockSize
+        val totalChunks = image.size / chunkBytes
+        val out = ByteArrayOutputStream()
+        out.write(le32(0xED26FF3A.toInt()))
+        out.write(le16(1))
+        out.write(le16(0))
+        out.write(le16(28))
+        out.write(le16(12))
+        out.write(le32(blockSize))
+        out.write(le32(totalBlocks))
+        out.write(le32(totalChunks))
+        out.write(le32(0))
+        for (index in 0 until totalChunks) {
+            out.write(le16(0xCAC1))
+            out.write(le16(0))
+            out.write(le32(blocksPerChunk))
+            out.write(le32(chunkBytes))
+            out.write(image, index * chunkBytes, chunkBytes)
+        }
+        return out.toByteArray()
+    }
+
+    private fun le16(value: Int): ByteArray =
+        byteArrayOf(value.toByte(), (value shr 8).toByte())
+
+    private fun le32(value: Int): ByteArray =
+        byteArrayOf(
+            value.toByte(),
+            (value shr 8).toByte(),
+            (value shr 16).toByte(),
+            (value shr 24).toByte(),
+        )
 
     private fun analyze(file: File, gzip: Boolean): GsiFacts {
         return withSource(file) { source ->
