@@ -214,6 +214,33 @@ class PartitionsViewModel @Inject constructor(
         }
     }
 
+    fun showFormatConfirmation(entry: DsuImageEntry) {
+        _uiState.update {
+            it.copy(sheet = PartitionsSheetState.CONFIRM_FORMAT, pendingFormat = entry)
+        }
+    }
+
+    fun confirmFormatImage() {
+        val entry = _uiState.value.pendingFormat ?: return
+        _uiState.update { it.copy(sheet = PartitionsSheetState.NONE) }
+        viewModelScope.launch(Dispatchers.IO) {
+            PrivilegedProvider.run(
+                onFail = {
+                    _uiState.update { it.copy(panel = PartitionsPanelState.Error(R.string.partitions_service_unavailable)) }
+                },
+            ) {
+                val code = runCatching { formatDsuImage(entry.prefix, entry.name) }
+                    .getOrDefault(PartitionResult.SERVICE_UNAVAILABLE)
+                if (code == PartitionResult.OK) {
+                    refresh()
+                } else {
+                    _uiState.update { it.copy(panel = PartitionsPanelState.Error(messageFor(code))) }
+                }
+            }
+            _uiState.update { it.copy(pendingFormat = null) }
+        }
+    }
+
     fun confirmDeleteImage() {
         val entry = _uiState.value.pendingDelete ?: return
         _uiState.update { it.copy(sheet = PartitionsSheetState.NONE) }
@@ -247,7 +274,9 @@ class PartitionsViewModel @Inject constructor(
     }
 
     fun dismissSheet() {
-        _uiState.update { it.copy(sheet = PartitionsSheetState.NONE, pendingDelete = null, pendingAdd = null) }
+        _uiState.update {
+            it.copy(sheet = PartitionsSheetState.NONE, pendingDelete = null, pendingAdd = null, pendingFormat = null)
+        }
     }
 
     private fun startExport(entry: DsuImageEntry, fd: ParcelFileDescriptor) {
@@ -321,6 +350,8 @@ class PartitionsViewModel @Inject constructor(
             PartitionResult.SIZE_INVALID -> R.string.partitions_size_invalid
             PartitionResult.NO_SPACE -> R.string.partitions_no_space
             PartitionResult.CANCELLED -> R.string.partitions_cancelled
+            PartitionResult.DSU_RUNNING -> R.string.partitions_format_dsu_running
+            PartitionResult.UNSUPPORTED -> R.string.partitions_format_unsupported
             else -> R.string.partitions_operation_failed
         }
     }

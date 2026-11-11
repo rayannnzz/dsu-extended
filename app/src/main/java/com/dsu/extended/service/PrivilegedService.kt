@@ -418,6 +418,69 @@ class PrivilegedService : IPrivilegedService.Stub() {
         }
     }
 
+    override fun formatDsuImage(prefix: String?, imageName: String?): Int {
+        val name = imageName ?: return PartitionResult.INVALID_NAME
+        if (!isValidImageName(name) || prefix.isNullOrEmpty()) return PartitionResult.INVALID_NAME
+        if (!isUserdataImage(name)) return PartitionResult.UNSUPPORTED
+        val dsuRunning = runCatching {
+            requiresDynamicSystem() && DYNAMIC_SYSTEM!!.isInUse
+        }.getOrDefault(false)
+        if (dsuRunning) return PartitionResult.DSU_RUNNING
+        return runGsiOperation {
+            // Release any inspector-held mount/mapping first, or remapping fails.
+            synchronized(inspectorLock) { teardownInspectorMount() }
+            val imageService = requiresGsiService().openImageService(prefix)
+            if (!imageService.backingImageExists(name)) {
+                return@runGsiOperation PartitionResult.NOT_FOUND
+            }
+            // Still mapped after releasing our own mount: the image is in active use.
+            if (imageService.isImageMapped(name)) {
+                return@runGsiOperation PartitionResult.DSU_RUNNING
+            }
+            val mappedImage = MappedImage()
+            imageService.mapImageDevice(name, PartitionResult.MAP_TIMEOUT_MS, mappedImage)
+            val devicePath = mappedImage.path
+            try {
+                if (devicePath.isNullOrEmpty() || !wipeMappedImageHeader(devicePath)) {
+                    PartitionResult.IO_ERROR
+                } else {
+                    PartitionResult.OK
+                }
+            } finally {
+                runCatching { imageService.unmapImageDevice(name) }
+            }
+        }
+    }
+
+    /**
+     * Mirrors gsid's PartitionInstaller::WipeWritable: zero the first 1 MiB of the mapped
+     * image so the old filesystem superblock is destroyed. The framework recreates the
+     * filesystem the next time the DSU boots, effectively factory-resetting userdata.
+     */
+    private fun wipeMappedImageHeader(devicePath: String): Boolean {
+        return try {
+            val zeroes = ByteArray(4096)
+            FileOutputStream(devicePath).use { output ->
+                var remaining = WIPE_HEADER_BYTES
+                while (remaining > 0) {
+                    val chunk = minOf(remaining, zeroes.size.toLong()).toInt()
+                    output.write(zeroes, 0, chunk)
+                    remaining -= chunk
+                }
+                output.fd.sync()
+            }
+            true
+        } catch (e: Exception) {
+            Log.e(BuildConfig.APPLICATION_ID, "failed to wipe image header at $devicePath", e)
+            false
+        }
+    }
+
+    private fun isUserdataImage(imageName: String): Boolean {
+        val normalized = imageName.removeSuffix(".img").lowercase(Locale.ROOT)
+        return normalized == "userdata" || normalized.startsWith("userdata_")
+    }
+
     private var transferThread: ExecutorService? = null
     private var transferCancelled = AtomicBoolean(false)
     private var transferListener: IPartitionTransferListener? = null
@@ -979,5 +1042,6 @@ class PrivilegedService : IPrivilegedService.Stub() {
         val IMAGE_NAME_REGEX = Regex("[A-Za-z0-9_.-]+")
         private val INSPECT_MOUNT_BASE = File("/data/system/dsu_extended_inspect")
         private const val MAX_LISTING_ENTRIES = 1000
+        private const val WIPE_HEADER_BYTES = 1024L * 1024L
     }
 }

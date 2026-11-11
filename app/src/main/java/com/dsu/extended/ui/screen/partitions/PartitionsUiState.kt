@@ -39,6 +39,7 @@ enum class PartitionsSheetState {
     ADD_IMAGE,
     CONFIRM_REPLACE,
     CONFIRM_DELETE,
+    CONFIRM_FORMAT,
 }
 
 data class PendingAddImage(
@@ -60,4 +61,10 @@ data class PartitionsUiState(
     val pendingAdd: PendingAddImage? = null,
     val pendingReplace: PendingReplaceImage? = null,
     val pendingDelete: DsuImageEntry? = null,
+    val pendingFormat: DsuImageEntry? = null,
 )
+
+fun DsuImageEntry.isUserdataImage(): Boolean {
+    val normalized = name.removeSuffix(".img").lowercase()
+    return normalized == "userdata" || normalized.startsWith("userdata_")
+}

@@ -328,7 +328,13 @@
     <string name="partitions_image_title">DSU image</string>
     <string name="partitions_action_replace">Replace</string>
     <string name="partitions_action_export">Export</string>
+    <string name="partitions_action_format">Format</string>
     <string name="partitions_action_delete">Delete</string>
+    <string name="partitions_format_title">Format userdata?</string>
+    <string name="partitions_format_description">%1$s will be erased and recreated empty the next time the DSU boots. All apps and data inside the DSU will be lost. This action cannot be undone.</string>
+    <string name="partitions_format_confirm">Format</string>
+    <string name="partitions_format_dsu_running">Reboot into your main system before formatting DSU userdata.</string>
+    <string name="partitions_format_unsupported">Only userdata images can be formatted.</string>
     <string name="partitions_progress_adding">Adding %1$s…</string>
     <string name="partitions_progress_replacing">Replacing %1$s…</string>
     <string name="partitions_progress_exporting">Exporting %1$s…</string>

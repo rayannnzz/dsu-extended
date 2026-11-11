@@ -11,6 +11,8 @@ object PartitionResult {
     const val SERVICE_UNAVAILABLE = 7
     const val CANCELLED = 8
     const val IO_ERROR = 9
+    const val DSU_RUNNING = 10
+    const val UNSUPPORTED = 11
 
     const val COPY_BUFFER_BYTES = 4 * 1024 * 1024
     const val BYTES_PER_PROGRESS_STEP = 32L * 1024 * 1024

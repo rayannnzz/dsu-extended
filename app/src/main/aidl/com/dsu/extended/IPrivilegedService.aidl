@@ -57,4 +57,7 @@ interface IPrivilegedService {
     @nullable List<DsuFileEntry> listPartitionFiles(String prefix, String imageName, String relativePath) = 4023;
     boolean startExportPartitionFile(String prefix, String imageName, String relativePath,
             in ParcelFileDescriptor outputFd, @nullable IPartitionTransferListener listener) = 4024;
+
+    // Wipe a writable DSU image (userdata) header so its filesystem is recreated on next boot. Root-only.
+    int formatDsuImage(String prefix, String imageName) = 4025;
 }

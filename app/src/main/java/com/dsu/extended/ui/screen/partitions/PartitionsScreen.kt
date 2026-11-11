@@ -23,6 +23,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.DeleteForever
 import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.RestartAlt
 import androidx.compose.material.icons.rounded.SaveAs
 import androidx.compose.material.icons.rounded.SwapVert
 import androidx.compose.material.icons.rounded.Storage
@@ -158,6 +159,7 @@ fun Partitions(
                                 }
                                 pickReplacementLauncher.launch(intent)
                             },
+                            onFormatClick = { partitionsViewModel.showFormatConfirmation(it) },
                             onDeleteClick = { partitionsViewModel.showDeleteConfirmation(it) },
                         )
                     }
@@ -211,6 +213,7 @@ fun Partitions(
         PartitionsSheetState.ADD_IMAGE -> AddImageSheet(uiState, partitionsViewModel)
         PartitionsSheetState.CONFIRM_REPLACE -> ReplaceSheet(uiState, partitionsViewModel)
         PartitionsSheetState.CONFIRM_DELETE -> DeleteSheet(uiState, partitionsViewModel)
+        PartitionsSheetState.CONFIRM_FORMAT -> FormatSheet(uiState, partitionsViewModel)
         PartitionsSheetState.NONE -> {}
     }
 }
@@ -256,6 +259,7 @@ private fun ReadyPanel(
     listState: androidx.compose.foundation.lazy.LazyListState,
     onExportClick: (DsuImageEntry) -> Unit,
     onReplaceClick: (DsuImageEntry) -> Unit,
+    onFormatClick: (DsuImageEntry) -> Unit,
     onDeleteClick: (DsuImageEntry) -> Unit,
 ) {
     if (uiState.groups.isEmpty()) {
@@ -301,6 +305,7 @@ private fun ReadyPanel(
                     enabled = uiState.transfer == null && uiState.sheet == PartitionsSheetState.NONE,
                     onExportClick = onExportClick,
                     onReplaceClick = onReplaceClick,
+                    onFormatClick = onFormatClick,
                     onDeleteClick = onDeleteClick,
                 )
             }
@@ -315,10 +320,12 @@ private fun ImageRow(
     enabled: Boolean,
     onExportClick: (DsuImageEntry) -> Unit,
     onReplaceClick: (DsuImageEntry) -> Unit,
+    onFormatClick: (DsuImageEntry) -> Unit,
     onDeleteClick: (DsuImageEntry) -> Unit,
 ) {
     val replaceLabel = stringResource(id = R.string.partitions_action_replace)
     val exportLabel = stringResource(id = R.string.partitions_action_export)
+    val formatLabel = stringResource(id = R.string.partitions_action_format)
     val deleteLabel = stringResource(id = R.string.partitions_action_delete)
     CardBox(
         modifier = Modifier.fillMaxWidth(),
@@ -366,6 +373,14 @@ private fun ImageRow(
                     icon = { Icon(Icons.Rounded.SaveAs, contentDescription = null) },
                     enabled = enabled,
                 )
+                if (entry.isUserdataImage()) {
+                    clickableItem(
+                        onClick = { onFormatClick(entry) },
+                        label = formatLabel,
+                        icon = { Icon(Icons.Rounded.RestartAlt, contentDescription = null) },
+                        enabled = enabled,
+                    )
+                }
                 clickableItem(
                     onClick = { onDeleteClick(entry) },
                     label = deleteLabel,
@@ -490,6 +505,22 @@ private fun DeleteSheet(
         confirmText = stringResource(id = R.string.partitions_delete_confirm),
         cancelText = stringResource(id = R.string.partitions_cancel),
         onClickConfirm = { viewModel.confirmDeleteImage() },
+        onClickCancel = { viewModel.dismissSheet() },
+    )
+}
+
+@Composable
+private fun FormatSheet(
+    uiState: PartitionsUiState,
+    viewModel: PartitionsViewModel,
+) {
+    DialogLikeBottomSheet(
+        icon = Icons.Rounded.RestartAlt,
+        title = stringResource(id = R.string.partitions_format_title),
+        text = stringResource(id = R.string.partitions_format_description, uiState.pendingFormat?.name ?: ""),
+        confirmText = stringResource(id = R.string.partitions_format_confirm),
+        cancelText = stringResource(id = R.string.partitions_cancel),
+        onClickConfirm = { viewModel.confirmFormatImage() },
         onClickCancel = { viewModel.dismissSheet() },
     )
 }
